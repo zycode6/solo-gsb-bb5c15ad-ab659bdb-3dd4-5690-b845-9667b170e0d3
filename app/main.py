@@ -10,11 +10,14 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 from . import database
+from .dispense import DispensePlanError, build_dispense_plan
 from .forecast import ForecastError, build_forecast
 from .irrigation import build_plan
 from .models import (
     ConsumptionForecastRequest,
     ConsumptionForecastResult,
+    DispensePlanRequest,
+    DispensePlanResult,
     IrrigationPlanRequest,
     IrrigationPlanResult,
     RecipeSummary,
@@ -228,6 +231,59 @@ def consumption_forecast(
     except ForecastError as exc:
         raise HTTPException(status_code=422, detail={"message": str(exc)})
     return ConsumptionForecastResult(**forecast)
+
+
+@app.post(
+    "/api/recipes/{recipe_id}/versions/{version}/dispense-plan",
+    response_model=DispensePlanResult,
+    tags=["recipes"],
+    summary="按整数泵送次数生成可执行投料（泵送）方案",
+)
+def dispense_plan(
+    recipe_id: int, version: int, req: DispensePlanRequest
+) -> DispensePlanResult:
+    """读取指定配方版本，按每种浓缩液的单次泵送量求解整数泵送次数。
+
+    - 变量为各浓缩液的**非负整数**泵送次数 ``k_i``，投料量 = 单次泵送量
+      ``p_i`` × ``k_i``；稀释水 ``w = 目标总体积 - Σ p_i·k_i`` 补足剩余
+      体积，原水矿物质贡献按该**实际稀释水量**计算（不是固定预扣）。
+    - 目标为最小化各目标元素的最大相对偏差（minimax MILP，HiGHS 求解），
+      同时满足单液可用量/使用上限（按整泵次）、最低稀释水量与浓缩液
+      最大占比等硬约束。
+    - 整数步长无法在版本容差内达标时，仍返回**最优可执行方案**并在
+      ``violations`` 中说明原因；体积硬约束本身无解（如版本中
+      ``min_water_ml`` 与占比约束冲突）时返回 ``feasible=false`` 并说明。
+    - 单次泵送量非法（非正/NaN）、泵配置缺失或多余、名称重复或步长超过
+      单液上限返回 422；配方/版本不存在返回 404。
+    """
+    recipe = database.get_recipe(recipe_id)
+    if recipe is None:
+        raise HTTPException(404, "配方不存在")
+    row = database.get_version(recipe_id, version)
+    if row is None:
+        raise HTTPException(404, "该版本不存在")
+
+    version_payload = database.serialize_version(row)
+    try:
+        solve_req = SolveRequest.model_validate(version_payload["request"])
+    except Exception as exc:  # stored payload should always re-validate
+        raise HTTPException(
+            status_code=500,
+            detail={"message": f"配方版本请求参数无法解析：{exc}"},
+        )
+
+    steps = {p.concentrate: p.pump_step_ml for p in req.pumps}
+    try:
+        plan = build_dispense_plan(
+            recipe_id=recipe_id,
+            version=version,
+            req=solve_req,
+            solve_result=version_payload["result"],
+            steps=steps,
+        )
+    except DispensePlanError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)})
+    return DispensePlanResult(**plan)
 
 
 @app.get(

@@ -52,6 +52,7 @@ DATABASE_PATH=./hydroponic.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/recipes/{id}/versions/{v}` | 读取某版本完整内容（请求 + 结果） |
 | GET | `/api/recipes/{id}/versions/{v}/export` | **导出该版本 JSON 文件** |
 | POST | `/api/recipes/{id}/versions/{v}/consumption-forecast` | **库存消耗预测**：按灌溉计划逐批次等比例扣减浓缩液，输出每日消耗/剩余与首个不足日期（支持 `suspended_dates` 本地停灌日） |
+| POST | `/api/recipes/{id}/versions/{v}/dispense-plan` | **整数泵送投料方案**：传入各浓缩液单次泵送量，求解整数泵送次数（minimax 整数规划），稀释水补足剩余体积 |
 | POST | `/api/irrigation/plan` | **灌溉计划**：按 IANA 时区生成逐日执行批次（DST/跨午夜/容量校验/本地停灌日） |
 | GET | `/health` | 健康检查 |
 
@@ -575,13 +576,140 @@ curl -s -X POST \
 - **404**：配方不存在、或该配方下版本不存在（如 `/api/recipes/1/versions/99/...`）；
 - **422**：库存名称未知（`未知浓缩液：C液`）、缺少某液（`库存缺少…浓缩液`）、库存为负或名称重复；以及灌溉计划参数的全部校验失败（非法时区/日期、空或重复时段、非正时长/水量、`suspended_dates` 重复或超出日期范围、多余字段）。
 
+## 整数泵送投料方案（POST /api/recipes/{id}/versions/{v}/dispense-plan）
+
+连续求解告诉操作员的是"每瓶浓缩液用多少 **mL**"，但实际加药泵只能按**固定单次泵送量整泵次**投料。本接口读取已保存的配方版本，在请求中给出**每种浓缩液泵的单次泵送量（mL）**，服务用 **minimax 混合整数线性规划**（scipy / HiGHS MILP）求各泵的**非负整数泵送次数**，目标同样是：
+
+> **最小化各目标元素实际配出量相对目标量的最大相对偏差。**
+
+投料与稀释规则：
+
+- 浓缩液 i 的实际投料量 = 单次泵送量 `p_i` × 泵送次数 `k_i`（`k_i` 必须为非负整数）；
+- **稀释水补足剩余体积**：`w = 版本目标总体积 − Σ p_i·k_i`；
+- **原水贡献按实际稀释水量计算**：元素实际量 = `Σ 浓缩液浓度 × p_i·k_i / 1000 + 原水浓度 × w / 1000`（随整数方案求出的 `w` 线性变化，**不会**按总体积预扣固定一笔原水量）；
+- 同时满足版本中的全部**硬约束**：单液可用量 / `max_volume` 使用上限（按整泵次计）、`min_water_ml` 最低稀释水量、`max_concentrate_fraction` 浓缩液最大占比。
+
+与试算接口一致的两种"不达标"语义：
+
+- **整数步长无法达到容差**：仍返回 HTTP **200** 与 `feasible=true` 的**最优可执行方案**（`within_tolerance=false`），`violations` 用 `ELEMENT_SHORTAGE`（瓶子整泵次到顶仍不足）/ `ELEMENT_SURPLUS`（原水或成分配比耦合导致压不下来）/ `ELEMENT_DEVIATION`（多个元素在整数网格上互相制约）说明原因；
+- **体积硬约束本身无解**（版本中 `min_water_ml` 超过总体积、或与浓缩液占比上限冲突）：返回 `feasible=false`，`violations` 给出 `WATER_MIN_EXCEEDS_VOLUME` / `CONCENTRATE_FRACTION_CONFLICT` 与具体原因。
+
+### 请求
+
+泵配置中的名称必须与该版本请求中的浓缩液**一一对应**（缺失、多余、重复、步长非法均返回 422）；单次泵送量必须为正且有限，且不能超过该液单液上限（否则连泵一次都无法执行）。
+
+```bash
+curl -s -X POST \
+  http://localhost:8000/api/recipes/1/versions/1/dispense-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "pumps": [
+      {"concentrate": "A液", "pump_step_ml": 100},
+      {"concentrate": "B液", "pump_step_ml": 25}
+    ]
+  }'
+```
+
+### 响应（步长恰好对齐连续最优解时）
+
+沿用上文 10 L 叶菜配方（连续最优 A=1500 mL、B=125 mL、水=8375 mL）：A 泵单次 100 mL 恰好 15 次、B 泵单次 25 mL 恰好 5 次，偏差为 0：
+
+```json
+{
+  "recipe_id": 1,
+  "version": 1,
+  "recipe_feasible": true,
+  "warning": null,
+  "feasible": true,
+  "optimal": true,
+  "within_tolerance": true,
+  "tolerance": 0.05,
+  "max_relative_deviation": 0.0,
+  "total_volume_ml": 10000.0,
+  "water_volume_ml": 8375.0,
+  "concentrate_total_ml": 1625.0,
+  "min_water_ml": 7000.0,
+  "max_concentrate_fraction": 0.2,
+  "allocations": [
+    {"concentrate": "A液", "pump_step_ml": 100.0, "pump_count": 15,
+     "volume_ml": 1500.0, "cap_ml": 2000.0, "max_pumps": 20,
+     "available_volume_ml": 2000.0},
+    {"concentrate": "B液", "pump_step_ml": 25.0, "pump_count": 5,
+     "volume_ml": 125.0, "cap_ml": 2000.0, "max_pumps": 80,
+     "available_volume_ml": 2000.0}
+  ],
+  "elements": [
+    {"element": "N", "target_concentration": 180.0, "actual_concentration": 180.0,
+     "target_amount_mg": 1800.0, "actual_amount_mg": 1800.0,
+     "concentrate_amount_mg": 1800.0, "source_water_amount_mg": 0.0,
+     "relative_deviation": 0.0, "status": "ok"}
+  ],
+  "violations": [],
+  "message": "整数泵送方案求解成功：所有泵均按整泵次投料，稀释水补足剩余体积，各目标元素偏差均在版本容差范围内。"
+}
+```
+
+### 步长对不齐时：仍返回最优可执行方案
+
+例如 A 泵单次 120 mL、B 泵单次 15 mL 时，整数网格上的最优折中是 **A 12 次（1440 mL）+ B 8 次（120 mL）+ 水 8440 mL**，N/P/K 恰好统一偏低 4.00%，未超 5% 容差，仍 `within_tolerance=true`：
+
+```bash
+curl -s -X POST http://localhost:8000/api/recipes/1/versions/1/dispense-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"pumps": [{"concentrate": "A液", "pump_step_ml": 120},
+                 {"concentrate": "B液", "pump_step_ml": 15}]}'
+```
+
+```json
+{
+  "feasible": true,
+  "within_tolerance": true,
+  "max_relative_deviation": 0.04,
+  "water_volume_ml": 8440.0,
+  "concentrate_total_ml": 1560.0,
+  "allocations": [
+    {"concentrate": "A液", "pump_step_ml": 120.0, "pump_count": 12, "volume_ml": 1440.0, ...},
+    {"concentrate": "B液", "pump_step_ml": 15.0,  "pump_count": 8,  "volume_ml": 120.0, ...}
+  ],
+  "elements": [
+    {"element": "N", "actual_amount_mg": 1728.0, "relative_deviation": -0.04, "status": "ok", ...},
+    {"element": "P", "actual_amount_mg": 480.0,  "relative_deviation": -0.04, "status": "ok", ...},
+    {"element": "K", "actual_amount_mg": 816.0,  "relative_deviation": -0.04, "status": "ok", ...}
+  ]
+}
+```
+
+步长再粗（如 A 250 mL / B 80 mL）时最优偏差超过容差，则 `within_tolerance=false`，但**最优可执行方案照常返回**（泵次数、投料量、稀释水量、逐元素偏差都完整），`violations` 说明是供给不足还是成分配比耦合；此时操作员可调小泵的单次泵送量后重算。
+
+### 原水基线随实际稀释水量变化
+
+对带 `source_water` 的版本（10 L，目标 Ca=100、Mg=40 mg/L，原水 Ca=40、Mg=30；连续最优 C 液 1000 mL + 水 9000 mL）：
+
+- C 泵单次 **50 mL**：20 次 = 1000 mL，水 9000 mL，Ca 原水贡献 = 40 mg/L × 9.0 L = **360 mg**，精确达标；
+- C 泵单次 **60 mL**：17 次 = 1020 mL，水 8980 mL，Ca = 浓缩液 652.8 mg + 原水 `40 × 8.98 = 359.2 mg` = 1012 mg（+1.2%），Mg 偏差 +0.5%。
+
+注意原水项用的是整数方案的**实际水量 8980 mL**（不是 9000，也不是总体积 10000）。
+
+要点：
+
+- 每次请求只是按版本内容与泵配置**即时求解**，不改动、不新增配方版本；
+- `allocations[].max_pumps = floor(cap / pump_step_ml)` 给出该瓶在单液上限内最多能泵的次数；
+- 通过 `?force=true` 保存的不可行版本也可求泵送方案：响应带 `recipe_feasible=false` 与 `warning`，整数方案仍按版本的目标浓度、总体积、原水基线与体积约束求解，结果仅供参考；
+- `elements[]` 与试算接口字段一致（含 `concentrate_amount_mg` / `source_water_amount_mg` 拆分、`relative_deviation`、`status`）。
+
+错误码：
+
+- **404**：配方不存在、或该配方下版本不存在；
+- **422**：`pumps` 中出现版本没有的浓缩液（`未知浓缩液：…`）、缺少某液（`缺少浓缩液 … 的泵配置`）、名称重复、`pumps` 为空、单次泵送量非正/非数值（`NaN`/`Infinity`）、或单次泵送量超过该液单液上限（`…连泵送一次都无法执行…`）；多余字段同样 422。
+
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 灌溉计划 / 消耗预测）
+│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 灌溉计划 / 消耗预测 / 泵送方案）
 │   ├── solver.py     # minimax LP 建模与无可行解诊断
+│   ├── dispense.py   # 整数泵送 minimax MILP（HiGHS）：整泵次投料 + 稀释水补足
 │   ├── irrigation.py # 灌溉批次生成：时区/DST 解析、跨午夜、合并、容量校验
 │   ├── forecast.py   # 库存消耗预测：按实际批次等比例扣减、缺口标记、逐日汇总
 │   ├── models.py     # Pydantic 请求/响应模型

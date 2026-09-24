@@ -795,4 +795,256 @@ with TestClient(app) as client:
     fc_422({"suspended_dates": ["2026-05-04"]}, "suspended after range")
     print("27) forecast suspended days: no deduction, cross-midnight kept")
 
+    # =================================================================== #
+    # Integer pump-count dispense plan
+    # (POST /api/recipes/{id}/versions/{v}/dispense-plan)
+    # =================================================================== #
+    # Saved 10 L recipe: continuous optimum A 1500 mL + B 125 mL + 8375 water
+    dp_rid = rid  # 叶菜通用配方 v1 created in step 9
+    dp_url = f"/api/recipes/{dp_rid}/versions/1/dispense-plan"
+
+    def dp_body(a_step, b_step, **extra):
+        body = {"pumps": [
+            {"concentrate": "A液", "pump_step_ml": a_step},
+            {"concentrate": "B液", "pump_step_ml": b_step},
+        ]}
+        body.update(extra)
+        return body
+
+    def brute_force_dispense(a_step, b_step,
+                             a_cap=2000.0, b_cap=2000.0,
+                             V=10000.0, min_water=7000.0, frac=0.20):
+        """Enumerate integer pump counts (mirrors dispense.py coefficients)."""
+        import itertools
+        import math as _math
+        targets = {"N": (180.0, {"A液": 1.2, "B液": 0.0}),
+                   "P": (50.0, {"A液": 0.0, "B液": 4.0}),
+                   "K": (85.0, {"A液": 0.4, "B液": 2.0})}
+        kmax = [int(_math.floor(a_cap / a_step + 1e-7)),
+                int(_math.floor(b_cap / b_step + 1e-7))]
+        smax = min(frac * V, a_step * kmax[0] + b_step * kmax[1])
+        best = None
+        for ka, kb in itertools.product(range(kmax[0] + 1), range(kmax[1] + 1)):
+            S = a_step * ka + b_step * kb
+            if S > smax + 1e-9 or V - S < min_water - 1e-9:
+                continue
+            w = V - S
+            worst = 0.0
+            rows = {}
+            for e, (tc, coef) in targets.items():
+                T = tc * V / 1000.0
+                act = coef["A液"] * a_step * ka + coef["B液"] * b_step * kb
+                rows[e] = act
+                worst = max(worst, abs(act - T) / T)
+            if best is None or worst < best[0] - 1e-12:
+                best = (worst, (ka, kb), S, w, rows)
+        return kmax, smax, best
+
+    # 35) aligned pump steps: exact mix 15 A shots + 5 B shots ------------ #
+    r = client.post(dp_url, json=dp_body(100, 25))
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["feasible"] is True and d["within_tolerance"] is True
+    assert d["optimal"] is True
+    assert d["max_relative_deviation"] == 0.0
+    al = {x["concentrate"]: x for x in d["allocations"]}
+    assert al["A液"]["pump_count"] == 15
+    assert al["A液"]["volume_ml"] == 1500.0
+    assert al["A液"]["max_pumps"] == 20
+    assert al["B液"]["pump_count"] == 5
+    assert al["B液"]["volume_ml"] == 125.0
+    assert d["concentrate_total_ml"] == 1625.0
+    assert d["water_volume_ml"] == 8375.0
+    assert d["total_volume_ml"] == 10000.0
+    assert all(e["status"] == "ok" for e in d["elements"])
+    assert abs(sum(x["volume_ml"] for x in d["allocations"])
+               + d["water_volume_ml"] - 10000) < 1e-6
+    # source water baseline rows exist and are zero here
+    for e in d["elements"]:
+        assert e["source_water_amount_mg"] == 0.0
+        assert e["concentrate_amount_mg"] == e["actual_amount_mg"]
+    print("35) aligned dispense: A 15x100 + B 5x25, water 8375, dev 0")
+
+    # 36) unaligned steps: MILP result equals exhaustive brute-force best - #
+    for a_step, b_step in [(120, 15), (97, 23), (150, 40), (33, 7)]:
+        kmax_b, smax_b, bf = brute_force_dispense(a_step, b_step)
+        assert bf is not None
+        r = client.post(dp_url, json=dp_body(a_step, b_step))
+        assert r.status_code == 200, r.text
+        d = r.json()
+        al = {x["concentrate"]: x for x in d["allocations"]}
+        got_counts = (al["A液"]["pump_count"], al["B液"]["pump_count"])
+        # minimax optimum: worst deviation must match the brute-force value
+        assert abs(d["max_relative_deviation"] - bf[0]) < 1e-5, (
+            a_step, b_step, got_counts, bf, d["max_relative_deviation"])
+        assert abs(d["concentrate_total_ml"]
+                   - (a_step * got_counts[0] + b_step * got_counts[1])) < 1e-9
+        assert abs(d["water_volume_ml"]
+                   - 10000 + d["concentrate_total_ml"]) < 1e-6
+        # every allocation respects bottle caps / water / fraction
+        assert d["concentrate_total_ml"] <= 2000 + 1e-9
+        assert d["water_volume_ml"] >= 7000 - 1e-9
+        # element rows are internally consistent
+        S = d["concentrate_total_ml"]
+        for el in d["elements"]:
+            assert abs(el["actual_amount_mg"]
+                       - el["concentrate_amount_mg"]
+                       - el["source_water_amount_mg"]) < 1e-6
+            assert abs(el["actual_amount_mg"] * 1000.0 / 10000
+                       - el["actual_concentration"]) < 1e-6
+        if bf[0] <= 0.05 + 1e-9:
+            assert d["within_tolerance"] is True
+            assert d["violations"] == []
+        else:
+            assert d["within_tolerance"] is False
+            assert d["violations"], (a_step, b_step)
+            # still the best executable plan, feasible with volume hard limits
+            assert d["feasible"] is True
+        print(f"36) steps ({a_step},{b_step}): MILP counts {got_counts} "
+              f"== brute {bf[1]}, max dev {bf[0]:.4%}")
+
+    # 37) step beyond tolerance still returns best executable plan -------- #
+    r = client.post(dp_url, json=dp_body(250, 80))
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["feasible"] is True
+    assert d["within_tolerance"] is False
+    assert d["max_relative_deviation"] > 0.05
+    assert d["violations"]
+    codes = {v["code"] for v in d["violations"]}
+    assert codes <= {"ELEMENT_SHORTAGE", "ELEMENT_SURPLUS",
+                     "ELEMENT_DEVIATION", "TOLERANCE_UNREACHABLE"}
+    # counts and water remain executable
+    al = {x["concentrate"]: x for x in d["allocations"]}
+    assert al["A液"]["pump_count"] * 250 <= 2000 + 1e-9
+    assert al["B液"]["pump_count"] * 80 <= 2000 + 1e-9
+    print("37) coarse steps: best executable plan still returned:",
+          d["message"][:40])
+
+    # 38) source-water baseline: source contribution tracks actual water -- #
+    sw_url = f"/api/recipes/{sw_rid}/versions/1/dispense-plan"
+    r = client.post(sw_url, json={"pumps": [
+        {"concentrate": "C液", "pump_step_ml": 50}]})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    al = {x["concentrate"]: x for x in d["allocations"]}
+    # continuous optimum C = 1000 mL -> 20 shots of 50 mL exactly
+    assert al["C液"]["pump_count"] == 20
+    assert d["concentrate_total_ml"] == 1000.0
+    assert d["water_volume_ml"] == 9000.0
+    rows = {e["element"]: e for e in d["elements"]}
+    assert abs(rows["Ca"]["concentrate_amount_mg"] - 640) < 1e-3
+    assert abs(rows["Ca"]["source_water_amount_mg"] - 360) < 1e-3
+    assert abs(rows["Ca"]["actual_amount_mg"] - 1000) < 1e-3
+    assert abs(rows["Mg"]["source_water_amount_mg"] - 270) < 1e-3
+    assert d["within_tolerance"] is True
+    # unaligned 60 mL step -> brute force expected k=17, water 8980
+    r = client.post(sw_url, json={"pumps": [
+        {"concentrate": "C液", "pump_step_ml": 60}]})
+    d = r.json()
+    assert d["allocations"][0]["pump_count"] == 17, d
+    assert d["water_volume_ml"] == 8980.0
+    rows = {e["element"]: e for e in d["elements"]}
+    assert abs(rows["Ca"]["concentrate_amount_mg"] - 652.8) < 1e-3
+    assert abs(rows["Ca"]["source_water_amount_mg"] - 359.2) < 1e-3
+    assert abs(rows["Ca"]["actual_amount_mg"] - 1012.0) < 1e-3
+    print("38) dispense raw-water contribution follows actual water")
+
+    # 39) volume hard-constraint infeasible version -> feasible=false ------ #
+    conflict_req = base_request()
+    conflict_req["min_water_ml"] = 9600
+    conflict_req["max_concentrate_fraction"] = 0.05
+    cid = client.post("/api/recipes?force=true",
+                      json={"name": "体积冲突配方", "request": conflict_req}
+                      ).json()["recipe_id"]
+    r = client.post(
+        f"/api/recipes/{cid}/versions/1/dispense-plan",
+        json=dp_body(100, 25))
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["feasible"] is False
+    assert d["within_tolerance"] is False
+    assert any(v["code"] == "CONCENTRATE_FRACTION_CONFLICT"
+               for v in d["violations"]), d["violations"]
+    # min_water > V variant
+    over_req = base_request()
+    over_req["min_water_ml"] = 12000
+    oid = client.post("/api/recipes?force=true",
+                      json={"name": "水超体积配方", "request": over_req}
+                      ).json()["recipe_id"]
+    d = client.post(
+        f"/api/recipes/{oid}/versions/1/dispense-plan",
+        json=dp_body(100, 25)).json()
+    assert d["feasible"] is False
+    assert any(v["code"] == "WATER_MIN_EXCEEDS_VOLUME"
+               for v in d["violations"])
+    print("39) hard volume infeasibility reported with reason")
+
+    # 40) 404 on missing recipe / version --------------------------------- #
+    assert client.post(
+        "/api/recipes/999/versions/1/dispense-plan",
+        json=dp_body(100, 25)).status_code == 404
+    assert client.post(
+        f"/api/recipes/{dp_rid}/versions/99/dispense-plan",
+        json=dp_body(100, 25)).status_code == 404
+
+    # 41) 422 on illegal / mismatched pump configs ------------------------ #
+    def dp_422(body, label):
+        rr = client.post(dp_url, json=body)
+        assert rr.status_code == 422, (label, rr.status_code, rr.text[:300])
+
+    dp_422({"pumps": [{"concentrate": "A液", "pump_step_ml": 100},
+                      {"concentrate": "C液", "pump_step_ml": 25}]},
+           "unknown concentrate")
+    dp_422({"pumps": [{"concentrate": "A液", "pump_step_ml": 100}]},
+           "missing B")
+    dp_422({"pumps": [{"concentrate": "A液", "pump_step_ml": 100},
+                      {"concentrate": "B液", "pump_step_ml": 25},
+                      {"concentrate": "A液", "pump_step_ml": 10}]},
+           "duplicate pump")
+    dp_422({"pumps": [{"concentrate": "A液", "pump_step_ml": 0},
+                      {"concentrate": "B液", "pump_step_ml": 25}]},
+           "zero step")
+    dp_422({"pumps": [{"concentrate": "A液", "pump_step_ml": -5},
+                      {"concentrate": "B液", "pump_step_ml": 25}]},
+           "negative step")
+    dp_422({"pumps": [{"concentrate": "A液", "pump_step_ml": "NaN"},
+                      {"concentrate": "B液", "pump_step_ml": 25}]},
+           "NaN string step")
+    dp_422({"pumps": [{"concentrate": "A液", "pump_step_ml": "Infinity"},
+                      {"concentrate": "B液", "pump_step_ml": 25}]},
+           "Infinity string step")
+    dp_422({"pumps": [{"concentrate": "A液", "pump_step_ml": "x"},
+                      {"concentrate": "B液", "pump_step_ml": 25}]},
+           "non-numeric step")
+    dp_422({"pumps": []}, "empty pumps")
+    bad_pumps = dp_body(100, 25)
+    bad_pumps["bogus"] = 1
+    dp_422(bad_pumps, "extra field")
+    bad_pumps = dp_body(100, 25)
+    bad_pumps["pumps"][0]["bogus"] = 1
+    dp_422(bad_pumps, "extra nested field")
+    # step larger than the bottle cap (even one shot is impossible)
+    rr = client.post(dp_url, json=dp_body(2001, 25))
+    assert rr.status_code == 422 and "上限" in rr.json()["detail"]["message"]
+    # unknown-concentrate message is actionable
+    rr = client.post(dp_url, json={"pumps": [
+        {"concentrate": "A液", "pump_step_ml": 100},
+        {"concentrate": "X液", "pump_step_ml": 25}]})
+    assert "未知浓缩液" in rr.json()["detail"]["message"]
+    print("40-41) dispense 404/422: missing versions, illegal/mismatched "
+          "pump configs all rejected")
+
+    # 42) force-saved infeasible (element-wise) version: warning but plan
+    #     is still computed against the version's targets/constraints ----- #
+    d = client.post(
+        f"/api/recipes/{bad_id}/versions/1/dispense-plan",
+        json={"pumps": [
+            {"concentrate": "A液", "pump_step_ml": 25},
+            {"concentrate": "B液", "pump_step_ml": 25}]}).json()
+    assert d["recipe_feasible"] is False
+    assert d["warning"] and "不可行" in d["warning"]
+    assert d["feasible"] is True
+    print("42) dispense over infeasible force-saved version carries warning")
+
 print("\nALL SMOKE TESTS PASSED")
