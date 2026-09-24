@@ -51,6 +51,7 @@ DATABASE_PATH=./hydroponic.db uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/api/recipes/{id}/versions` | 某配方的全部版本 |
 | GET | `/api/recipes/{id}/versions/{v}` | 读取某版本完整内容（请求 + 结果） |
 | GET | `/api/recipes/{id}/versions/{v}/export` | **导出该版本 JSON 文件** |
+| POST | `/api/recipes/{id}/versions/{v}/dispense-plan` | **整数泵送投料方案**：按各浓缩液单次泵送量（mL）求整数泵次，最小化各元素最大相对偏差 |
 | POST | `/api/recipes/{id}/versions/{v}/consumption-forecast` | **库存消耗预测**：按灌溉计划逐批次等比例扣减浓缩液，输出每日消耗/剩余与首个不足日期（支持 `suspended_dates` 本地停灌日） |
 | POST | `/api/irrigation/plan` | **灌溉计划**：按 IANA 时区生成逐日执行批次（DST/跨午夜/容量校验/本地停灌日） |
 | GET | `/health` | 健康检查 |
@@ -136,7 +137,7 @@ curl -s http://localhost:8000/api/solve \
 `violations.code` 取值：
 
 - `WATER_MIN_EXCEEDS_VOLUME` —— 稀释水下限超过目标总体积；
-- `CONCENTRATE_FRACTION_CONFLICT` —— 稀释水下限与浓缩液最大占比互相冲突；
+- `CONCENTRATE_FRACTION_CONFLICT` —— 稀释水下限超过目标总体积时，无法在满足浓缩液最大占比的同时补足稀释水（与上一条一同出现）；注意：最低稀释水量本身就是浓缩液占比的下限（水越多、浓缩液越少），`min_water_ml ≤ V` 时两者不会互相冲突；
 - `ELEMENT_SHORTAGE` —— 某元素即使所有相关浓缩液用到上限仍不足（附到达上限的瓶子）；
 - `ELEMENT_SURPLUS` —— 满足其他元素下限时该元素必然超量（浓缩液成分耦合）；
 - `ELEMENT_DEVIATION` —— 多个元素互相制约，最优折中仍超出容差；
@@ -247,6 +248,98 @@ curl -s http://localhost:8000/api/recipes/1/versions/1
 # 导出为 JSON 文件（Content-Disposition attachment）
 curl -s -OJ http://localhost:8000/api/recipes/1/versions/1/export
 ```
+
+### 5. 整数泵送投料方案（POST /api/recipes/{id}/versions/{v}/dispense-plan）
+
+实际加药泵每次只能泵出**固定体积**：给定已保存配方版本与每种浓缩液的**单次泵送量**（mL），服务用**混合整数线性规划**（HiGHS）求各液的**非负整数泵送次数**，使得各目标元素实际配出量相对目标量的**最大相对偏差最小**。
+
+- 浓缩液 i 的实际投料量 = `pump_step_ml × pump_count`（**整数倍步长**）；
+- **稀释水精确补足剩余体积**：`water_volume_ml = 目标总体积 − Σ 各液投料量`；
+- **原水贡献按实际稀释水量计算**：`原水浓度 × 实际稀释水量 ÷ 1000`，而不是按目标总体积预扣；
+- 同时满足版本中的**单液可用量 / `max_volume` 使用上限**、**最低稀释水量** `min_water_ml` 与**浓缩液最大占比** `max_concentrate_fraction`；
+- 求解分两阶段：先最小化最大相对偏差，再在最优偏差下**最小化泵次总数**（确定性、更省动作的折中方案）。
+
+> 整数步长导致最优方案仍超版本容差时，**照常返回该最优可执行方案**（HTTP 200，`feasible=true, within_tolerance=false`），并在 `elements[].relative_deviation/status` 与 `violations` 中逐元素说明；只有**体积硬约束本身无解**（如版本参数 `min_water_ml > 目标总体积`）时才返回 `feasible=false` 并给出原因。
+
+请求（每一种该版本用到的浓缩液都必须恰好给一次，按名称匹配）：
+
+```bash
+curl -s -X POST http://localhost:8000/api/recipes/1/versions/1/dispense-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "pumps": [
+      {"concentrate": "A液", "pump_step_ml": 125},
+      {"concentrate": "B液", "pump_step_ml": 125}
+    ]
+  }'
+```
+
+该版本（10 L，N/P/K=180/50/85，A 液 1200 N + 400 K mg/L，B 液 4000 P + 2000 K mg/L）的连续最优解是 A=1500 mL、B=125 mL；步长恰好整除时，整数解零偏差：
+
+```json
+{
+  "recipe_id": 1,
+  "version": 1,
+  "feasible": true,
+  "within_tolerance": true,
+  "optimal": true,
+  "max_relative_deviation": 0.0,
+  "total_volume_ml": 10000.0,
+  "water_volume_ml": 8375.0,
+  "concentrate_total_ml": 1625.0,
+  "total_pump_count": 13,
+  "tolerance": 0.05,
+  "min_water_ml": 7000.0,
+  "max_concentrate_fraction": 0.2,
+  "pumps": [
+    {"concentrate": "A液", "pump_step_ml": 125.0, "pump_count": 12,
+     "volume_ml": 1500.0, "cap_ml": 2000.0,
+     "available_volume_ml": 2000.0, "max_pumps": 16, "note": null},
+    {"concentrate": "B液", "pump_step_ml": 125.0, "pump_count": 1,
+     "volume_ml": 125.0, "cap_ml": 2000.0,
+     "available_volume_ml": 2000.0, "max_pumps": 16, "note": null}
+  ],
+  "elements": [
+    {"element": "N", "target_concentration": 180.0, "actual_concentration": 180.0,
+     "target_amount_mg": 1800.0, "actual_amount_mg": 1800.0,
+     "concentrate_amount_mg": 1800.0, "source_water_amount_mg": 0.0,
+     "relative_deviation": 0.0, "status": "ok"}
+    /* P、K 同样为 0 偏差，此处省略 */
+  ],
+  "violations": [],
+  "message": "泵送方案求解成功：整数泵次下各目标元素偏差均在版本容差范围内。"
+}
+```
+
+字段要点：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `pumps[].pump_count` | **非负整数**泵送次数；`volume_ml = pump_step_ml × pump_count` |
+| `pumps[].max_pumps` | 受该液可用量 / `max_volume` 限制时允许的最大泵次数 `⌊cap / step⌋` |
+| `pumps[].note` | 例如**单次泵送量已超过该液上限**（哪怕泵一次都不可能，故 `pump_count` 只能为 0）时给出提示；正常为 `null` |
+| `water_volume_ml` | 实际稀释水量（补足剩余体积）；原水矿物质按此水量贡献 |
+| `elements[]` | 逐元素的目标/实际浓度、目标/实际 mg、浓缩液贡献、原水贡献、`relative_deviation`（带符号）与 `status`（`ok`/`under`/`over`/`unconstrained`） |
+| `within_tolerance` | 最优整数方案的最大相对偏差是否 ≤ 版本 `tolerance`；**即使为 false 也返回最优可执行方案** |
+| `feasible` | 体积硬约束（体积等式 / 最低稀释水 / 浓缩液占比 / 单液上限）下是否存在任何整数方案；`false` 时泵次全为 0，原因见 `violations`（如 `WATER_MIN_EXCEEDS_VOLUME`、`CONCENTRATE_FRACTION_CONFLICT`） |
+| `violations` | 步长无法达标时为逐元素的 `ELEMENT_DEVIATION`（含容差边界与实际 mg）；硬约束无解时为体积类诊断码 |
+
+整数步长无法达标示例：A 液步长 200 mL、B 液步长 125 mL 时，最优整数方案为 7×200 + 1×125 = 1525 mL（水 8475 mL），N 偏低 6.67%（超 5% 容差），P/K 仍在容差内——响应 `within_tolerance=false`、`max_relative_deviation=0.0667`，`violations` 含一条 N 的 `ELEMENT_DEVIATION`，但方案本身可直接执行：
+
+```bash
+curl -s -X POST http://localhost:8000/api/recipes/1/versions/1/dispense-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"pumps": [
+        {"concentrate": "A液", "pump_step_ml": 200},
+        {"concentrate": "B液", "pump_step_ml": 125}]}'
+# -> within_tolerance=false, pumps: A×7 (1400 mL), B×1 (125 mL),
+#    water 8475 mL, violations=[{code:"ELEMENT_DEVIATION", element:"N", ...}]
+```
+
+错误码：
+
+- **404**：配方不存在、或该配方下版本不存在；
+- **422**：泵配置**缺少**某液、出现版本中**多余（未知）**的浓缩液、同名重复、`pumps` 为空、单次泵送量**非正 / 非有限值**（`0`、负数、`NaN`、`Infinity`）或不是数字（如 `"125"`），以及多余字段。
 
 ## 灌溉计划（POST /api/irrigation/plan）
 
@@ -580,8 +673,9 @@ curl -s -X POST \
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 灌溉计划 / 消耗预测）
+│   ├── main.py       # FastAPI 路由（试算 / 保存 / 版本 / 导出 / 整数泵送 / 灌溉计划 / 消耗预测）
 │   ├── solver.py     # minimax LP 建模与无可行解诊断
+│   ├── dispense.py   # 整数泵送方案：MILP（HiGHS）求整数泵次、最小化最大相对偏差
 │   ├── irrigation.py # 灌溉批次生成：时区/DST 解析、跨午夜、合并、容量校验
 │   ├── forecast.py   # 库存消耗预测：按实际批次等比例扣减、缺口标记、逐日汇总
 │   ├── models.py     # Pydantic 请求/响应模型
@@ -589,6 +683,6 @@ curl -s -X POST \
 │   └── config.py     # 元素清单、默认容差、DB 路径
 ├── Dockerfile
 ├── docker-compose.yml
-├── smoke_test.py     # TestClient 端到端冒烟测试
+├── smoke_test.py     # TestClient 端到端冒烟测试（含整数方案的暴力枚举对照）
 └── requirements.txt
 ```

@@ -315,17 +315,23 @@ def _hard_volume_checks(req: SolveRequest, caps: np.ndarray) -> list[dict]:
             )
         )
 
-    max_water_by_fraction = V * (1.0 - req.max_concentrate_fraction)
-    if req.min_water_ml > max_water_by_fraction + _EPS:
+    # Both ``w >= min_water_ml`` and ``w >= (1 - fraction) * V`` are LOWER
+    # bounds, so they cannot conflict with each other: dilution water just
+    # has to clear the larger floor.  The fraction cap can only conflict
+    # with the water floor when the floor exceeds the total volume itself
+    # (then no mixture can hold that much water while staying within the
+    # concentrate share) — reported together with WATER_MIN_EXCEEDS_VOLUME
+    # so callers see every violated user constraint.
+    if req.min_water_ml > V + _EPS:
         violations.append(
             _violation(
                 "CONCENTRATE_FRACTION_CONFLICT",
                 (
-                    f"浓缩液最大占比 {req.max_concentrate_fraction:.0%} 时"
-                    f"最多只能加水 {max_water_by_fraction:g} mL，"
-                    f"低于稀释水下限 {req.min_water_ml:g} mL。"
+                    f"稀释水下限 {req.min_water_ml:g} mL 已超过目标总体积 "
+                    f"{V:g} mL，无法在满足浓缩液最大占比 "
+                    f"{req.max_concentrate_fraction:.0%} 的同时补足稀释水。"
                 ),
-                limit=max_water_by_fraction,
+                limit=V,
                 actual=req.min_water_ml,
             )
         )

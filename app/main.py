@@ -2,19 +2,25 @@
 from __future__ import annotations
 
 import json
+import math
 from contextlib import asynccontextmanager
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import database
+from .dispense import DispenseError, build_dispense_plan
 from .forecast import ForecastError, build_forecast
 from .irrigation import build_plan
 from .models import (
     ConsumptionForecastRequest,
     ConsumptionForecastResult,
+    DispensePlanRequest,
+    DispensePlanResult,
     IrrigationPlanRequest,
     IrrigationPlanResult,
     RecipeSummary,
@@ -43,6 +49,36 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
+def _sanitize_json(value):
+    """Replace non-JSON floats (NaN/Inf) with their textual names.
+
+    Pydantic rejects those inputs with 422, but it also echoes the offending
+    value in the error detail; Starlette's strict JSON encoder would then
+    turn the 422 into a 500 while rendering.  Stringify such values so the
+    validation error is serializable.
+    """
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, dict):
+        return {k: _sanitize_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_json(v) for v in value]
+    return value
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request, exc: RequestValidationError):
+    detail = _sanitize_json(exc.errors())
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(detail)},
+    )
 
 
 @app.get("/health", tags=["system"])
@@ -228,6 +264,52 @@ def consumption_forecast(
     except ForecastError as exc:
         raise HTTPException(status_code=422, detail={"message": str(exc)})
     return ConsumptionForecastResult(**forecast)
+
+
+@app.post(
+    "/api/recipes/{recipe_id}/versions/{version}/dispense-plan",
+    response_model=DispensePlanResult,
+    tags=["recipes"],
+    summary="整数泵送投料方案：按单次泵送量求解各浓缩液泵送次数",
+)
+def dispense_plan(
+    recipe_id: int, version: int, req: DispensePlanRequest
+) -> DispensePlanResult:
+    """按版本目标浓度、总体积与原水基线，在固定单次泵送量下求整数泵次。
+
+    - 每种浓缩液的投料量必须是其 ``pump_step_ml`` 的非负整数倍；
+      稀释水精确补足 ``目标总体积 - 浓缩液投料量之和``，原水矿物质基线
+      按**实际稀释水量**计入，而非按目标总体积预扣。
+    - 以混合整数线性规划（HiGHS）最小化各目标元素的**最大相对偏差**；
+      最优偏差相同时取泵次总数最少的方案。
+    - 同时满足版本中的单液可用量 / ``max_volume`` 使用上限、
+      浓缩液最大占比与最低稀释水量；某液单次泵送量超过其上限时该液
+      泵次只能为 0，并在 ``note`` 中说明。
+    - 整数步长无法达到版本容差时仍返回最优可执行方案
+      （``feasible=true, within_tolerance=false``，逐元素偏差与
+      violations 照常给出）；体积硬约束无解时返回
+      ``feasible=false`` 并在 violations 中说明具体原因。
+    - 配方 / 版本不存在返回 404；泵配置缺失、多余、名称重复或步长
+      非正 / 非法返回 422。
+    """
+    recipe = database.get_recipe(recipe_id)
+    if recipe is None:
+        raise HTTPException(404, "配方不存在")
+    row = database.get_version(recipe_id, version)
+    if row is None:
+        raise HTTPException(404, "该版本不存在")
+
+    request_payload = json.loads(row["request_json"])
+    try:
+        plan = build_dispense_plan(
+            recipe_id=recipe_id,
+            version=version,
+            request_payload=request_payload,
+            pumps=[(p.concentrate, p.pump_step_ml) for p in req.pumps],
+        )
+    except DispenseError as exc:
+        raise HTTPException(status_code=422, detail={"message": str(exc)})
+    return DispensePlanResult(**plan)
 
 
 @app.get(

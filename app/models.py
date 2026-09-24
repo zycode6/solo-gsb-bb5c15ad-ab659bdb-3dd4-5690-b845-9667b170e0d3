@@ -541,3 +541,113 @@ class ConsumptionForecastResult(BaseModel):
     liquids: list[ForecastLiquidSummary]
     day_results: list[ForecastDay]
     batches: list[ForecastBatch]
+
+
+# --------------------------------------------------------------------------- #
+# Integer pump-stroke dispense planning
+# --------------------------------------------------------------------------- #
+class PumpDoseInput(BaseModel):
+    """One pump's fixed per-stroke delivery for a recipe concentrate."""
+
+    concentrate: str = Field(
+        ..., min_length=1, description="配方版本中的浓缩液名称"
+    )
+    pump_step_ml: float = Field(
+        ...,
+        gt=0,
+        strict=True,
+        description=(
+            "单次泵送量 (mL)，必须为有限正数（数字，不接受 \"125\" 这类"
+            "数字字符串）；该液总投料量为此值的整数倍"
+        ),
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("pump_step_ml")
+    @classmethod
+    def _finite_step(cls, v: float) -> float:
+        # float("nan") / float("inf") pass Pydantic's gt check; reject them
+        # explicitly as illegal stroke sizes.
+        if v != v or v in (float("inf"), float("-inf")):
+            raise ValueError("单次泵送量必须为有限正数")
+        return float(v)
+
+
+class DispensePlanRequest(BaseModel):
+    """Per-concentrate single-stroke pump volumes for one recipe version."""
+
+    pumps: list[PumpDoseInput] = Field(
+        ..., min_length=1, description="各浓缩液的单次泵送量；名称须与配方版本一一对应"
+    )
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("pumps")
+    @classmethod
+    def _unique_pumps(cls, v: list[PumpDoseInput]) -> list[PumpDoseInput]:
+        names = [p.concentrate for p in v]
+        if len(names) != len(set(names)):
+            raise ValueError("泵配置中浓缩液名称不能重复")
+        return v
+
+
+class DispensePumpResult(BaseModel):
+    """Planned integer stroke count and resulting dosage of one pump."""
+
+    concentrate: str
+    pump_step_ml: float = Field(..., description="单次泵送量 (mL)")
+    pump_count: int = Field(
+        ..., description="泵送次数（非负整数）；实际投料量 = pump_step_ml × pump_count"
+    )
+    volume_ml: float = Field(..., description="实际投料量 (mL)")
+    cap_ml: float = Field(
+        ..., description="本配方中该液使用上限 = min(可用体积, max_volume) (mL)"
+    )
+    available_volume_ml: float = Field(..., description="该液可用体积 (mL)")
+    max_pumps: int = Field(
+        ..., description="受单液可用量/使用上限约束时该液允许的最大泵次数"
+    )
+    note: Optional[str] = Field(
+        None,
+        description=(
+            "异常提示：例如单次泵送量已超过该液上限（此时 pump_count 只能为 0）；"
+            "正常为 null"
+        ),
+    )
+
+
+class DispensePlanResult(BaseModel):
+    recipe_id: int
+    version: int
+    feasible: bool = Field(
+        ...,
+        description=(
+            "体积硬约束（体积等式、最低稀释水量、浓缩液占比、单液上限）"
+            "是否存在可执行整数方案；false 时泵次数全为 0，原因见 violations"
+        ),
+    )
+    within_tolerance: bool = Field(
+        ...,
+        description="最优整数泵送方案的各元素最大相对偏差是否达到版本容差 tolerance",
+    )
+    optimal: bool = Field(
+        ..., description="整数 minimax 求解器是否返回最优解（否则为可行近似）"
+    )
+    max_relative_deviation: Optional[float] = Field(
+        ..., description="最优整数泵送方案的各元素最大相对偏差（分数）"
+    )
+    total_volume_ml: float
+    water_volume_ml: float = Field(
+        ...,
+        description="稀释水量 = 目标总体积 - 各液实际投料量之和；原水贡献按此实际水量计算",
+    )
+    concentrate_total_ml: float
+    total_pump_count: int = Field(..., description="各浓缩液泵次数合计")
+    tolerance: float = Field(..., description="采用的版本容差（分数）")
+    min_water_ml: float
+    max_concentrate_fraction: float
+    pumps: list[DispensePumpResult]
+    elements: list[ElementResult]
+    violations: list[Violation] = []
+    message: str = ""
